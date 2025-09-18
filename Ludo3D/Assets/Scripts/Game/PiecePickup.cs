@@ -1,195 +1,270 @@
+﻿using Board;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Events;
 
 [RequireComponent(typeof(Collider))]
 [RequireComponent(typeof(Rigidbody))]
 public class PiecePickup : MonoBehaviour
 {
-    [Header("Hover/Lift")]
-    [Tooltip("Desired hover amount while dragging (meters). Limited by Max Lift Height.")]
-    [Min(0f)] public float baseHoverHeight = 0.25f;
+    [Header("Refs")]
+    public Camera cam; // defaults to Camera.main if null
+    public LayerMask cellMask;
+    public LayerMask pieceMask;
+    public BoardGrid grid;
+    public BoardCell currentCell;
 
-    [Tooltip("Maximum allowed height above the ground while dragging (meters).")]
-    [Min(0.01f)] public float maxLiftHeight = 1.0f;
+    [Header("Visual Offset")]
+    [Tooltip("Offset applied on top of cell position. Example: (0,0.2,0) to keep the piece floating above the grid.")]
+    public Vector3 pieceOffset = new Vector3(0f, 0.2f, 0f);
 
-    [Header("Follow Tuning")]
-    [Tooltip("Higher = snappier following toward the mouse target.")]
-    [Range(1f, 60f)] public float followLerp = 20f;
+    [Header("Hover FX")]
+    public bool hoverWhenSelected = true;
+    public float hoverAmplitude = 0.1f;
+    public float hoverFrequency = 4f;
+    [Tooltip("If null, uses this transform. Prefer assigning a visual child.")]
+    public Transform hoverGraphic;
 
-    [Tooltip("Cap the object translation per physics tick (meters/sec).")]
-    [Min(0.1f)] public float maxMoveSpeed = 12f;
+    [Header("Movement")]
+    [Tooltip("Seconds per single-cell hop")]
+    public float stepDuration = 0.22f;
+    [Tooltip("Bounce apex height in meters")]
+    public float bounceHeight = 0.25f;
+    [Tooltip("If true, allow Manhattan path (H first then V) when target not aligned.")]
+    public bool allowManhattanPath = true;
 
-    [Header("Release")]
-    [Tooltip("Downward velocity applied on release for a satisfying plop.")]
-    [Min(0f)] public float plopForce = 4f;
+    [Header("Stability")]
+    [Tooltip("If true, pins world Y to cell Y + offset whenever not moving.")]
+    public bool lockYToGrid = false;
 
-    [Header("Grounding")]
-    [Tooltip("Layers considered 'ground' when figuring out height and clamp.")]
-    public LayerMask groundMask = ~0;
+    [Header("Events")]
+    public UnityEvent onSelected;
+    public UnityEvent onDeselected;
+    public UnityEvent onMoveStart;
+    public UnityEvent onMoveEnd;
 
-    [Tooltip("Max distance for the mouse ray when looking for ground.")]
-    [Min(5f)] public float rayMaxDistance = 200f;
+    private bool _selected;
+    private bool _moving;
 
-    private Rigidbody rb;
-    private Camera cam;
+    // Hover baselines
+    private Vector3 _baseLocalPos;
+    private Vector3 _baseWorldPos;
+    private float _hoverTime;
 
-    // drag state
-    private bool isDragging;
-    private Vector3 targetPoint;
-    private Vector3 horizontalGrabOffset; // preserves the XY screen pick offset on ground (X/Z in world)
-    private float clampedHover;            // effective hover during drag (min(baseHoverHeight, maxLiftHeight))
-
-    void Awake()
+    void Start()
     {
-        rb = GetComponent<Rigidbody>();
-        cam = Camera.main;
-        if (!cam)
-        {
-            Debug.LogWarning("[MouseDragRigidbody3D] No Camera.main found. Assign a MainCamera tag.");
-        }
+        if (cam == null) cam = Camera.main;
+        if (hoverGraphic == null) hoverGraphic = transform;
+
+        if (grid != null && currentCell != null)
+            transform.position = grid.GetCellWorldCenter(currentCell) + pieceOffset;
+
+        _baseLocalPos = hoverGraphic.localPosition;
+        _baseWorldPos = hoverGraphic.position;
     }
 
-    // -- Mouse Events (require a Collider on this object) ----------------------
-
-    void OnMouseDown()
+    void Update()
     {
-        if (!rb || !cam) return;
-
-        // Find where we clicked on THIS object to compute a horizontal offset,
-        // so the object doesn't jump when we start dragging.
-        Ray ray = cam.ScreenPointToRay(Input.mousePosition);
-        if (Physics.Raycast(ray, out var hit, rayMaxDistance))
+        if (!_moving && lockYToGrid && grid != null && currentCell != null)
         {
-            // horizontal offset between object center and hit point
-            Vector3 delta = transform.position - hit.point;
-            horizontalGrabOffset = new Vector3(delta.x, 0f, delta.z);
-        }
-        else
-        {
-            horizontalGrabOffset = Vector3.zero;
+            Vector3 basePos = grid.GetCellWorldCenter(currentCell) + pieceOffset;
+            transform.position = new Vector3(transform.position.x, basePos.y, transform.position.z);
         }
 
-        // turn off gravity while dragging (we'll use MovePosition)
-        rb.useGravity = false;
-        isDragging = true;
+        if (_moving) return;
 
-        clampedHover = Mathf.Min(baseHoverHeight, maxLiftHeight);
-    }
-
-    void OnMouseDrag()
-    {
-        if (!rb || !cam) return;
-
-        // Project mouse onto ground to get a base point
-        if (TryGetGroundPointUnderMouse(out Vector3 groundPt, out float groundY))
+        if (Input.GetMouseButtonDown(0))
         {
-            // keep the horizontal grab offset
-            Vector3 baseXZ = groundPt + horizontalGrabOffset;
-
-            // final Y is ground + min(hover, maxLift)
-            float targetY = Mathf.Min(groundY + maxLiftHeight, groundY + clampedHover);
-
-            targetPoint = new Vector3(baseXZ.x, targetY, baseXZ.z);
-        }
-        else
-        {
-            // Fallback: use a plane at current Y minus desired hover
-            Plane plane = new Plane(Vector3.up, new Vector3(0f, transform.position.y - clampedHover, 0f));
-            Ray ray = cam.ScreenPointToRay(Input.mousePosition);
-            if (plane.Raycast(ray, out float t))
-                targetPoint = ray.GetPoint(t) + horizontalGrabOffset;
+            if (RayHit(transform, pieceMask))
+            {
+                ToggleSelect(true);
+            }
             else
-                targetPoint = transform.position;
+            {
+                if (_selected && TryRaycastCell(out BoardCell targetCell))
+                {
+                    TryMoveTo(targetCell);
+                }
+                else if (_selected)
+                {
+                    ToggleSelect(false);
+                }
+            }
         }
+
+        HandleHover();
     }
 
-    void OnMouseUp()
+    void HandleHover()
     {
-        if (!rb) return;
+        bool hovering = _selected && hoverWhenSelected && hoverAmplitude > 0f && hoverFrequency > 0f;
 
-        isDragging = false;
-
-        // Re-enable gravity and give a small downward nudge
-        rb.useGravity = true;
-
-        // Wipe existing vertical motion for a consistent plop, keep horizontal
-        rb.velocity = new Vector3(rb.velocity.x, 0f, rb.velocity.z);
-
-        if (plopForce > 0f)
-            rb.AddForce(Vector3.down * plopForce, ForceMode.VelocityChange);
-    }
-
-    // -- Physics move ----------------------------------------------------------
-
-    void FixedUpdate()
-    {
-        if (!rb) return;
-
-        if (isDragging)
+        if (hovering)
         {
-            // Smoothly move toward targetPoint, clamped by maxMoveSpeed
-            Vector3 desired = targetPoint;
-            Vector3 next = ExponentialLerp(rb.position, desired, followLerp, Time.fixedDeltaTime);
-            Vector3 delta = next - rb.position;
+            _hoverTime += Time.deltaTime * hoverFrequency * Mathf.PI * 2f;
+            float y = Mathf.Sin(_hoverTime) * hoverAmplitude;
 
-            float maxStep = maxMoveSpeed * Time.fixedDeltaTime;
-            if (delta.magnitude > maxStep)
-                delta = delta.normalized * maxStep;
-
-            rb.MovePosition(rb.position + delta);
-
-            // Keep rotations unaffected unless you want to lock them:
-            // rb.MoveRotation(Quaternion.Euler(0, rb.rotation.eulerAngles.y, 0));
+            if (hoverGraphic == transform)
+            {
+                var p = transform.position + pieceOffset;
+                p.y = _baseWorldPos.y + y;
+                transform.position = p;
+            }
+            else
+            {
+                var lp = _baseLocalPos;
+                lp.y += y;
+                hoverGraphic.localPosition = lp;
+            }
         }
-    }
-
-    // -- Helpers ---------------------------------------------------------------
-
-    // Exponential smoothing toward target; stable across framerates.
-    private static Vector3 ExponentialLerp(Vector3 current, Vector3 target, float lerpPerSecond, float dt)
-    {
-        float t = 1f - Mathf.Exp(-Mathf.Max(0f, lerpPerSecond) * dt);
-        return Vector3.LerpUnclamped(current, target, t);
-    }
-
-    private bool TryGetGroundPointUnderMouse(out Vector3 point, out float groundY)
-    {
-        point = Vector3.zero;
-        groundY = 0f;
-
-        Ray ray = cam.ScreenPointToRay(Input.mousePosition);
-
-        // Prefer a ground hit (so we know actual ground Y for clamping)
-        if (Physics.Raycast(ray, out RaycastHit hit, rayMaxDistance, groundMask, QueryTriggerInteraction.Ignore))
+        else
         {
-            point = hit.point;
-            groundY = hit.point.y;
-            return true;
+            if (hoverGraphic == transform)
+            {
+                float newY = Mathf.Lerp(transform.position.y, _baseWorldPos.y, 10f * Time.deltaTime);
+                var p = transform.position; p.y = newY; transform.position = p;
+            }
+            else
+            {
+                hoverGraphic.localPosition = Vector3.Lerp(hoverGraphic.localPosition, _baseLocalPos, 10f * Time.deltaTime);
+            }
         }
+    }
 
+    public void ToggleSelect(bool on)
+    {
+        if (_moving) return;
+        if (_selected == on) return;
+        _selected = on;
+        if (_selected) onSelected?.Invoke(); else onDeselected?.Invoke();
+
+        _baseLocalPos = hoverGraphic.localPosition;
+        _baseWorldPos = hoverGraphic.position;
+        _hoverTime = 0f;
+    }
+
+    bool TryRaycastCell(out BoardCell cell)
+    {
+        cell = null;
+        if (cam == null) return false;
+        var ray = cam.ScreenPointToRay(Input.mousePosition);
+        if (Physics.Raycast(ray, out var hit, 1000f, cellMask))
+        {
+            cell = hit.collider.GetComponentInParent<BoardCell>();
+            return cell != null;
+        }
         return false;
     }
 
-#if UNITY_EDITOR
-    void OnDrawGizmosSelected()
+    bool RayHit(Transform t, LayerMask mask)
     {
-        if (!Application.isPlaying) return;
-        if (!isDragging) return;
-
-        Gizmos.color = new Color(0f, 0.5f, 1f, 0.35f);
-        Gizmos.DrawSphere(targetPoint, 0.08f);
-
-        // Visualize max height clamp above ground if we have a ground ray at target XZ
-        if (cam && TryGetGroundPointUnderMouse(out var ground, out var gy))
-        {
-            float capY = gy + maxLiftHeight;
-            Vector3 a = new Vector3(ground.x, gy, ground.z);
-            Vector3 b = new Vector3(ground.x, capY, ground.z);
-            Gizmos.color = new Color(1f, 0.8f, 0f, 0.7f);
-            Gizmos.DrawLine(a, b);
-            Gizmos.DrawWireSphere(b, 0.06f);
-        }
+        if (cam == null) return false;
+        var ray = cam.ScreenPointToRay(Input.mousePosition);
+        if (Physics.Raycast(ray, out var hit, 1000f, mask))
+            return hit.transform == t || hit.transform.IsChildOf(t);
+        return false;
     }
-#endif
+
+    public void TryMoveTo(BoardCell target)
+    {
+        if (_moving || target == null || grid == null || currentCell == null) return;
+
+        var path = BuildPath(currentCell, target);
+        if (path.Count == 0) return;
+
+        StartCoroutine(MovePath(path));
+    }
+
+    List<BoardCell> BuildPath(BoardCell start, BoardCell target)
+    {
+        var path = new List<BoardCell>();
+        if (start == target) return path;
+
+        int r = start.row, c = start.col;
+        int dr = target.row - r;
+        int dc = target.col - c;
+
+        if (dr == 0 || dc == 0)
+        {
+            int stepR = dr == 0 ? 0 : (dr > 0 ? 1 : -1);
+            int stepC = dc == 0 ? 0 : (dc > 0 ? 1 : -1);
+            while (r != target.row || c != target.col)
+            {
+                r += stepR; c += stepC;
+                if (grid.TryGetCell(r, c, out var next))
+                    path.Add(next);
+                else break;
+            }
+            return path;
+        }
+
+        if (!allowManhattanPath) return path;
+
+        int stepC2 = dc > 0 ? 1 : -1;
+        while (c != target.col)
+        {
+            c += stepC2;
+            if (grid.TryGetCell(r, c, out var next))
+                path.Add(next);
+            else return path;
+        }
+        int stepR2 = dr > 0 ? 1 : -1;
+        while (r != target.row)
+        {
+            r += stepR2;
+            if (grid.TryGetCell(r, c, out var next))
+                path.Add(next);
+            else return path;
+        }
+        return path;
+    }
+
+    IEnumerator MovePath(List<BoardCell> path)
+    {
+        _moving = true;
+        onMoveStart?.Invoke();
+        ToggleSelect(false);
+
+        foreach (var cell in path)
+        {
+            var startPos = transform.position;
+            var endPos = grid.GetCellWorldCenter(cell) + pieceOffset;
+            float t = 0f;
+
+            while (t < 1f)
+            {
+                t += Time.deltaTime / Mathf.Max(0.01f, stepDuration);
+                float u = Mathf.Clamp01(t);
+
+                var p = Vector3.Lerp(startPos, endPos, u);
+
+                float yArc = 4f * u * (1f - u) * bounceHeight;
+                p.y = endPos.y + yArc; // baseline includes offset
+                transform.position = p;
+
+                yield return null;
+            }
+
+            transform.position = endPos;
+            currentCell = cell;
+        }
+
+        onMoveEnd?.Invoke();
+        _moving = false;
+
+        _baseWorldPos = hoverGraphic.position;
+        _baseLocalPos = hoverGraphic.localPosition;
+        _hoverTime = 0f;
+    }
+
+    public void WarpTo(BoardCell cell)
+    {
+        if (grid == null || cell == null) return;
+        currentCell = cell;
+        transform.position = grid.GetCellWorldCenter(cell) + pieceOffset;
+        _baseWorldPos = hoverGraphic.position;
+        _baseLocalPos = hoverGraphic.localPosition;
+        _hoverTime = 0f;
+    }
 }
